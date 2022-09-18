@@ -234,8 +234,6 @@ func (r *Raft) maybeSend(to uint64, sendIfEmpty bool) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat() {
 	// Your Code Here (2A).
-	li := r.RaftLog.LastIndex()
-	term, _ := r.RaftLog.Term(li)
 	for to := range r.Prs {
 		if r.id != to {
 			msg := pb.Message{
@@ -243,8 +241,6 @@ func (r *Raft) sendHeartbeat() {
 				To:      to,
 				From:    r.id,
 				Term:    r.Term,
-				Index:   li,
-				LogTerm: term,
 				Entries: nil,
 			}
 			r.msgs = append(r.msgs, msg)
@@ -401,6 +397,11 @@ func (r *Raft) handleLeaderMsg(m pb.Message) {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgPropose:
 		r.handlePropose(m)
+	case pb.MessageType_MsgAppend:
+		if m.Term > r.Term {
+			r.State = StateFollower
+			r.Term = m.Term
+		}
 	case pb.MessageType_MsgAppendResponse:
 		r.handleAppendResponse(m)
 	}
