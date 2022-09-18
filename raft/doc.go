@@ -134,7 +134,7 @@ The total state machine handling loop will look something like this:
   }
 
 To propose changes to the state machine from your node take your application
-data, serialize it into a byte slice and call:
+data, serialize it into a byte unstableSlice and call:
 
 	n.Propose(data)
 
