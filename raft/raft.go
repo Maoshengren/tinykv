@@ -167,6 +167,17 @@ type Raft struct {
 	voteNum int
 	// reject number
 	rejectNum int
+	// an estimate of the size of the uncommitted tail of the Raft log. Used to
+	// prevent unbounded log growth. Only maintained by the leader. Reset on
+	// term changes.
+	uncommittedSize uint64
+	// Only one conf change may be pending (in the log, but not yet
+	// applied) at a time. This is enforced via pendingConfIndex, which
+	// is set to a value >= the log index of the latest pending
+	// configuration change (if any). Config changes are only allowed to
+	// be proposed if the leader's applied index is greater than this
+	// value.
+	pendingConfIndex uint64
 }
 
 // newRaft return a raft peer with the given config
@@ -192,6 +203,9 @@ func newRaft(c *Config) *Raft {
 		//if v != c.ID {
 		raft.Prs[v] = makeNewProgress()
 		//}
+	}
+	if !IsEmptyHardState(hs) {
+		raft.loadState(hs)
 	}
 	raft.becomeFollower(hs.Term, hs.Vote)
 	return raft
@@ -658,10 +672,6 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	}
 }
 
-//func (r *Raft) handleMessageAppend(m pb.Message) {
-//
-//}
-
 func (r *Raft) sendHeartBeatResponse(m pb.Message, reject bool) {
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
@@ -680,4 +690,88 @@ func makeNewProgress() *Progress {
 		Next:  1,
 	}
 	return p
+}
+
+func (r *Raft) softState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
+func (r *Raft) loadState(state pb.HardState) {
+	if state.Commit < r.RaftLog.committed || state.Commit > r.RaftLog.LastIndex() {
+		r.logger.Panicf("%x state.commit %d is out of range [%d, %d]", r.id, state.Commit, r.RaftLog.committed, r.RaftLog.LastIndex())
+	}
+	r.RaftLog.committed = state.Commit
+	r.Term = state.Term
+	r.Vote = state.Vote
+}
+
+func (r *Raft) advance(rd Ready) {
+	r.reduceUncommittedSize(rd.CommittedEntries)
+
+	// If entries were applied (or a snapshot), update our cursor for
+	// the next Ready. Note that if the current HardState contains a
+	// new Commit index, this does not mean that we're also applying
+	// all of the new entries due to commit pagination by size.
+	if newApplied := rd.appliedCursor(); newApplied > 0 {
+		//oldApplied := r.RaftLog.applied
+		r.RaftLog.appliedTo(newApplied)
+
+		//if oldApplied <= r.pendingConfIndex && newApplied >= r.pendingConfIndex && r.State == StateLeader {
+		//	// If the current (and most recent, at least for this leader's term)
+		//	// configuration should be auto-left, initiate that now. We use a
+		//	// nil Data which unmarshals into an empty ConfChangeV2 and has the
+		//	// benefit that appendEntry can never refuse it based on its size
+		//	// (which registers as zero).
+		//	ent := pb.Entry{
+		//		EntryType: pb.EntryType_EntryConfChange,
+		//		Data:      nil,
+		//	}
+		//	// There's no way in which this proposal should be able to be rejected.
+		//	if !r.appendEntry(&ent) {
+		//		panic("refused un-refusable auto-leaving ConfChangeV2")
+		//	}
+		//	r.pendingConfIndex = r.RaftLog.LastIndex()
+		//}
+	}
+
+	if len(rd.Entries) > 0 {
+		e := rd.Entries[len(rd.Entries)-1]
+		r.RaftLog.stableTo(e.Index, e.Term)
+	}
+	if !IsEmptySnap(&rd.Snapshot) {
+		r.RaftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
+	}
+}
+
+// reduceUncommittedSize accounts for the newly committed entries by decreasing
+// the uncommitted entry size limit.
+func (r *Raft) reduceUncommittedSize(ents []pb.Entry) {
+	if r.uncommittedSize == 0 {
+		// Fast-path for followers, who do not track or enforce the limit.
+		return
+	}
+
+	var s uint64
+	for _, e := range ents {
+		s += uint64(len(e.Data))
+	}
+	if s > r.uncommittedSize {
+		// uncommittedSize may underestimate the size of the uncommitted Raft
+		// log tail but will never overestimate it. Saturate at 0 instead of
+		// allowing overflow.
+		r.uncommittedSize = 0
+	} else {
+		r.uncommittedSize -= s
+	}
 }

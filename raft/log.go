@@ -98,13 +98,6 @@ func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 }
 
-//{EntryType:EntryNormal Term:1 Index:1 Data:[] XXX_NoUnkeyedLiteral:{} XXX_unrecognized:[] XXX_sizecache:0}
-//{EntryType:EntryNormal Term:3 Index:2 Data:[] XXX_NoUnkeyedLiteral:{} XXX_unrecognized:[] XXX_sizecache:0}
-//{EntryType:EntryNormal Term:4 Index:3 Data:[] XXX_NoUnkeyedLiteral:{} XXX_unrecognized:[] XXX_sizecache:0}
-//
-//{EntryType:EntryNormal Term:3 Index:2 Data:[] XXX_NoUnkeyedLiteral:{} XXX_unrecognized:[] XXX_sizecache:0}
-//{EntryType:EntryNormal Term:4 Index:3 Data:[] XXX_NoUnkeyedLiteral:{} XXX_unrecognized:[] XXX_sizecache:0}
-
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
@@ -398,4 +391,64 @@ func (l *RaftLog) zeroTermOnErrCompacted(t uint64, err error) uint64 {
 	}
 	l.logger.Panicf("unexpected error (%v)", err)
 	return 0
+}
+
+func (l *RaftLog) stableTo(i, t uint64) {
+	gt, ok := l.maybeTerm(i)
+	if !ok {
+		return
+	}
+	// if i < offset, term is matched with the snapshot
+	// only update the unstable entries if term is matched with
+	// an unstable entry.
+	if gt == t && i >= l.offset {
+		l.entries = l.entries[i+1-l.offset:]
+		l.offset = i + 1
+		l.shrinkEntriesArray()
+	}
+}
+
+func (l *RaftLog) stableSnapTo(i uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
+		l.pendingSnapshot = nil
+	}
+}
+
+func (l *RaftLog) appliedTo(i uint64) {
+	if i == 0 {
+		return
+	}
+	if l.committed < i || i < l.applied {
+		l.logger.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
+	}
+	l.applied = i
+}
+
+// shrinkEntriesArray discards the underlying array used by the entries slice
+// if most of it isn't being used. This avoids holding references to a bunch of
+// potentially large entries that aren't needed anymore. Simply clearing the
+// entries wouldn't be safe because clients might still be using them.
+func (l *RaftLog) shrinkEntriesArray() {
+	// We replace the array if we're using less than half of the space in
+	// it. This number is fairly arbitrary, chosen as an attempt to balance
+	// memory usage vs number of allocations. It could probably be improved
+	// with some focused tuning.
+	const lenMultiple = 2
+	if len(l.entries) == 0 {
+		l.entries = nil
+	} else if len(l.entries)*lenMultiple < cap(l.entries) {
+		newEntries := make([]pb.Entry, len(l.entries))
+		copy(newEntries, l.entries)
+		l.entries = newEntries
+	}
+}
+
+// TODO
+func (l *RaftLog) getUEnts() []pb.Entry {
+	// Your Code Here (2A).
+	if len(l.entries) == 0 {
+		return nil
+	}
+	li, _ := l.storage.LastIndex()
+	return l.entries[li:]
 }
